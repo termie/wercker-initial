@@ -8,13 +8,12 @@ This document analyzes the architecture, internal mechanics, and notable enginee
 1. [System Architecture Context](#1-system-architecture-context)
 2. [Deep Dives: Key Code Decisions & Interview Questions](#2-deep-dives-key-code-decisions--interview-questions)
    - [Decision 1: Persistent Shell Sessions & Sentinel-Based Command Protocol](#decision-1-persistent-shell-sessions--sentinel-based-command-protocol)
-   - [Decision 2: Concurrency Quirks, Select Bias & Channel Coordination](#decision-2-concurrency-quirks-select-bias--channel-coordination)
-   - [Decision 3: Container In-Guest Process Management & File Watcher](#decision-3-container-in-guest-process-management--file-watcher)
-   - [Decision 4: Resilient Two-Phase Pipelines, Container Restarts & After-Steps](#decision-4-resilient-two-phase-pipelines-container-restarts--after-steps)
-   - [Decision 5: Secrets Sandboxing, Passthrough Rules & Log Redaction](#decision-5-secrets-sandboxing-passthrough-rules--log-redaction)
-   - [Decision 6: In-Flight Tar Stream Transformation & Safety Guards](#decision-6-in-flight-tar-stream-transformation--safety-guards)
-   - [Decision 7: Polymorphic YAML Parsing & Extensible Step Architecture](#decision-7-polymorphic-yaml-parsing--extensible-step-architecture)
-   - [Decision 8: Signal Trapping, Cascading LIFO Shutdown & Deadlock Hazards](#decision-8-signal-trapping-cascading-lifo-shutdown--deadlock-hazards)
+   - [Decision 2: Container In-Guest Process Management & File Watcher](#decision-2-container-in-guest-process-management--file-watcher)
+   - [Decision 3: Resilient Two-Phase Pipelines, Container Restarts & After-Steps](#decision-3-resilient-two-phase-pipelines-container-restarts--after-steps)
+   - [Decision 4: Secrets Sandboxing, Passthrough Rules & Log Redaction](#decision-4-secrets-sandboxing-passthrough-rules--log-redaction)
+   - [Decision 5: In-Flight Tar Stream Transformation & Safety Guards](#decision-5-in-flight-tar-stream-transformation--safety-guards)
+   - [Decision 6: Polymorphic YAML Parsing & Extensible Step Architecture](#decision-6-polymorphic-yaml-parsing--extensible-step-architecture)
+   - [Decision 7: Signal Trapping, Cascading LIFO Shutdown & Deadlock Hazards](#decision-7-signal-trapping-cascading-lifo-shutdown--deadlock-hazards)
 3. [Interview Question Quick-Reference Matrix](#3-interview-question-quick-reference-matrix)
 
 ---
@@ -113,78 +112,7 @@ Because a bare streaming shell does not expose structured exit codes, Wercker in
 
 ---
 
-### Decision 2: Concurrency Quirks, Select Bias & Channel Coordination
-
-- **Relevant Files:**
-  - `core/session.go` (`Session.Send`, `Session.SendChecked`)
-  - `util/debouncer.go` (`Debouncer.Trigger`)
-
-#### The Code Decision
-In `Session.Send` (`core/session.go`), the code performs a pre-check to verify whether the session context has expired before sending commands:
-```go
-select {
-case <-sessionCtx.Done():
-    s.logger.Errorln("Session finished before sending commands:", commands)
-    return sessionCtx.Err()
-// Wait because if both cases are available golang will pick one randomly
-case <-time.After(1 * time.Millisecond):
-    // Pass
-}
-```
-In `Session.SendChecked` (`core/session.go`), a background goroutine manages activity timeouts:
-```go
-noResponseTimeout := make(chan struct{})
-go func() {
-    for {
-        select {
-        case <-noResponseTimeout:
-            continue
-        case <-time.After(time.Duration(s.options.NoResponseTimeout) * time.Millisecond):
-            stopReading <- struct{}{}
-            errChan <- fmt.Errorf("Command timed out after no response")
-            return
-        }
-    }
-}()
-```
-Meanwhile, in `util/debouncer.go`, event debouncing for file updates is implemented with a boolean flag and `time.AfterFunc`:
-```go
-func (d *Debouncer) Trigger() {
-    if d.settling {
-        return
-    }
-    d.settling = true
-    time.AfterFunc(d.settlePeriod, func() {
-        d.settling = false
-    })
-    select {
-    case d.c <- time.Now():
-    default:
-    }
-}
-```
-
-#### Context & Tradeoffs
-- **Go `select` Semantics:** In Go, if multiple cases in a `select` statement are simultaneously ready, the runtime selects one pseudo-randomly with uniform distribution. The authors added a 1ms delay to guarantee priority handling for context cancellation.
-- **Goroutine Leaks & Channel Allocation:**
-  - `time.After(...)` inside a tight `for-select` loop allocates a new `time.Timer` on every iteration, which cannot be garbage collected until the timer fires.
-  - If a command completes and returns before `noResponseTimeout` fires, this goroutine continues waiting on `noResponseTimeout` or the timer unless explicitly torn down.
-- **Data Races in `Debouncer`:**
-  - `d.settling` is read and modified across multiple goroutines (the main thread calling `Trigger()` and the runtime timer thread resetting `d.settling = false`) with zero synchronization (no mutex, no atomic operation).
-  - Calling this under `go test -race` triggers data race warnings.
-  - Furthermore, this struct behaves like a *leading-edge throttler* rather than a true debouncer: edits that occur while `d.settling == true` are dropped and will never trigger a trailing build.
-
-#### Interview Questions & Discussion Angles
-1. **Go Runtime & `select` Scheduling:**
-   > *"Why does Go's `select` statement choose pseudo-randomly among ready channels, and how should you properly check if a `context.Context` is already cancelled without introducing artificial sleeps (`time.Sleep` or `time.After`)?"*
-2. **Channel-Based Timer Leaks:**
-   > *"What happens to memory and goroutines when using `time.After` inside an unbounded `for-select` loop? How would you refactor `noResponseTimeout` using `time.NewTimer` and `timer.Reset`?"*
-3. **Concurrency Bug Hunting:**
-   > *"Review `util/debouncer.go`. Can you identify both the memory model race hazard and the functional behavior flaw regarding trailing-edge event coalescing?"*
-
----
-
-### Decision 3: Container In-Guest Process Management & File Watcher
+### Decision 2: Container In-Guest Process Management & File Watcher
 
 - **Relevant Files:**
   - `docker/watchstep.go` (`killProcesses`, `watch`, `Execute`)
@@ -235,7 +163,7 @@ util.GlobalSigint().Add(stopWatchHandler)
 
 ---
 
-### Decision 4: Resilient Two-Phase Pipelines, Container Restarts & After-Steps
+### Decision 3: Resilient Two-Phase Pipelines, Container Restarts & After-Steps
 
 - **Relevant Files:**
   - `cmd/main.go` (`executePipeline`)
@@ -279,7 +207,7 @@ Wercker resolves this using:
 
 ---
 
-### Decision 5: Secrets Sandboxing, Passthrough Rules & Log Redaction
+### Decision 4: Secrets Sandboxing, Passthrough Rules & Log Redaction
 
 - **Relevant Files:**
   - `util/environment.go` (`Environment`, `GetPassthru`, `GetHiddenPassthru`, `Interpolate`)
@@ -325,7 +253,7 @@ In `util/environment.go`:
 
 ---
 
-### Decision 6: In-Flight Tar Stream Transformation & Safety Guards
+### Decision 5: In-Flight Tar Stream Transformation & Safety Guards
 
 - **Relevant Files:**
   - `util/archive.go` (`ArchiveProcessor`, `Archive.Stream`, `ArchiveMaxSize`)
@@ -382,7 +310,7 @@ case <-time.After(1 * time.Second):
 
 ---
 
-### Decision 7: Polymorphic YAML Parsing & Extensible Step Architecture
+### Decision 6: Polymorphic YAML Parsing & Extensible Step Architecture
 
 - **Relevant Files:**
   - `core/config.go` (`RawBoxConfig`, `UnmarshalYAML`, `RawStepConfig`)
@@ -427,7 +355,7 @@ Rather than forcing a rigid schema, Wercker implements custom `UnmarshalYAML` me
 
 ---
 
-### Decision 8: Signal Trapping, Cascading LIFO Shutdown & Deadlock Hazards
+### Decision 7: Signal Trapping, Cascading LIFO Shutdown & Deadlock Hazards
 
 - **Relevant Files:**
   - `util/signal.go` (`SignalMonkey`, `Dispatch`, `Register`)
@@ -484,7 +412,6 @@ Use this matrix to match interview focus areas with specific Wercker components 
 | Focus Area | Wercker Mechanism | Target Files | Key Challenge / Discussion Prompt |
 | :--- | :--- | :--- | :--- |
 | **UNIX Systems & PTY** | In-band sentinel exit status detection | `core/session.go` | How to detect process completion and return codes across raw attached streams without a supervisor. |
-| **Go Concurrency** | Non-deterministic `select` bias & timers | `core/session.go`, `util/debouncer.go` | How Go schedules ready channel cases, risks of `time.After` in loops, and unsynchronized struct flags. |
 | **Container Internals** | Container PID 1 process management | `docker/watchstep.go` | Why killing processes in containers requires avoiding PID 1, and handling container signal propagation. |
 | **Distributed Resilience** | Two-phase pipelines with container restart | `cmd/main.go` | Designing workflow engines where failure reporting runs in restarted containers with exported post-mortem state. |
 | **Security & Secrets** | Passthrough conventions & log redaction | `util/environment.go`, `event/literalloghandler.go` | Stream-level vs token-level secret masking, and preventing credential leakage during interpolation and debugging. |
